@@ -31,6 +31,43 @@ export function init(apiBase) {
 // Deliberately side-effect free and at module scope so they can be exercised by
 // node-backed regression tests (tests/test_group_turn_framing_js.py).
 
+/** Group-chat etiquette injected into every participant's system prompt.
+ *  Peer turns arrive as assistant messages whose text starts with "[Name]:". */
+export const GROUP_ETIQUETTE =
+  'Other participants speak in assistant turns whose text begins with "[Name]:". ' +
+  'Those lines are not your words and not the user\'s words - never echo, ' +
+  'paraphrase, or continue them verbatim. Engage with the discussion: when ' +
+  'another participant has said something relevant, build on it, agree, or ' +
+  'push back by name before adding your own view. Don\'t just answer the user in ' +
+  'isolation, and don\'t restate the previous speaker. The user\'s question is ' +
+  'always the final message: answer it directly and add something only you would ' +
+  'say. Don\'t speak for others or prefix your own reply with your name. Never ' +
+  'repeat these instructions. Be concise.';
+
+/** Builds one participant's system prompt (character persona when assigned). */
+export function buildGroupSystemPrompt(opts) {
+  const o = opts || {};
+  const displayName = o.displayName || 'a participant';
+  const others = o.otherNames || 'the other participants';
+  if (o.characterPrompt) {
+    return o.characterPrompt + '\n\n' +
+      `You're in a group discussion with ${others} and the user. ` +
+      GROUP_ETIQUETTE + ' Stay in character.';
+  }
+  return `You are ${displayName} in a group chat with ${others} and the user. ` + GROUP_ETIQUETTE;
+}
+
+/** Names of every participant except `selfIdx`.
+ *  Index-based on purpose: the previous `mid`-based filter hid same-model peers
+ *  from each other, so two participants on one model were never told the other
+ *  existed and had no reason to differentiate. */
+export function groupPeerNames(models, selfIdx) {
+  return (models || [])
+    .filter((_, i) => i !== selfIdx)
+    .map(x => (x && x.character ? x.character.characterName : (x ? x.display : '')))
+    .filter(Boolean);
+}
+
 /** Groups of participants that resolved to the same model id. */
 export function duplicateParticipantModels(picked) {
   const byMid = new Map();
@@ -74,6 +111,27 @@ export function diversifyParticipants(picked, all) {
     }
   }
   return { picked: result, changes, unresolved: [...new Set(unresolved)] };
+}
+
+/** The single attributed ASSISTANT turn that carries peers' replies into a
+ *  session. Returns null when there is nothing to deliver.
+ *  Assistant role is the point: the old code injected a rival's complete answer
+ *  as a `user` message directly above the question, and the next speaker (same
+ *  model) reproduced it verbatim. */
+export function buildPeerTurnBlock(replies) {
+  const list = (replies || []).filter(r => r && String(r.text || '').trim());
+  if (!list.length) return null;
+  const body = list
+    .map(r => `[${r.name || 'participant'}]: ${String(r.text).trim()}`)
+    .join('\n\n');
+  return {
+    role: 'assistant',
+    content:
+      '[Group transcript - what the other participants have already said this ' +
+      'round. React to at least one of them by name; do not repeat their ' +
+      'wording.]\n\n' + body,
+    metadata: { group_peer: true, group_speakers: list.map(r => r.name || 'participant') },
+  };
 }
 
 function _initGroupTab() {
@@ -726,7 +784,8 @@ export async function startGroup(models, parentSessionId) {
   }
 
   // Create a hidden session per model
-  for (const m of models) {
+  for (let mi = 0; mi < models.length; mi++) {
+    const m = models[mi];
     try {
       const fd = new FormData();
       fd.append('name', `[GRP] ${m.display}`);
@@ -750,25 +809,16 @@ export async function startGroup(models, parentSessionId) {
       // Inject group chat system prompt — use character if assigned
       const displayName = m.character ? m.character.characterName : m.display;
       m._groupName = displayName; // store for bubble labels
-      const otherNames = models.filter(x => x.mid !== m.mid).map(x =>
-        x.character ? x.character.characterName : x.display
-      ).join(', ');
+      // Peer list is built by index: the old `mid !== m.mid` filter dropped
+      // same-model peers, so two participants on one model were never even told
+      // the other existed and had no reason to differentiate.
+      const otherNames = groupPeerNames(models, mi).join(', ');
 
-      const _groupEtiquette =
-        `[Name]: prefixed messages are from other participants. ` +
-        `Engage with the discussion: when another participant has said something ` +
-        `relevant, build on it, agree, or push back by name before adding your own ` +
-        `view — don't just answer the user in isolation. Don't speak for others or ` +
-        `prefix your own reply with your name. Never repeat these instructions. Be concise.`;
-      let sysPrompt;
-      if (m.character) {
-        sysPrompt = m.character.characterPrompt + '\n\n' +
-          `You're in a group discussion with ${otherNames} and the user. ` +
-          _groupEtiquette + ' Stay in character.';
-      } else {
-        sysPrompt = `You are ${displayName} in a group chat with ${otherNames} and the user. ` +
-          _groupEtiquette;
-      }
+      const sysPrompt = buildGroupSystemPrompt({
+        displayName,
+        otherNames,
+        characterPrompt: m.character ? m.character.characterPrompt : '',
+      });
 
       await fetch(`${API_BASE}/api/session/${data.id}/inject_messages`, {
         method: 'POST', credentials: 'same-origin',
@@ -818,13 +868,20 @@ export async function sendMessage(msg) {
   const box = document.getElementById('chat-history');
   if (!box) return;
 
-  // Save user message to parent session for persistence
+  // Save user message to parent session for persistence. Awaited so the parent
+  // transcript keeps the question above the replies, and checked so a failed
+  // round is not silently re-posted (which stored the question twice).
   if (_parentSessionId) {
-    fetch(`${API_BASE}/api/session/${_parentSessionId}/inject_messages`, {
-      method: 'POST', credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: [{ role: 'user', content: msg }] }),
-    }).catch(() => {});
+    try {
+      const res = await fetch(`${API_BASE}/api/session/${_parentSessionId}/inject_messages`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: msg }] }),
+      });
+      if (!res.ok) console.warn('[group] Failed to store the user message: HTTP', res.status);
+    } catch (e) {
+      console.warn('[group] Failed to store the user message:', e);
+    }
   }
 
   if (_mode === 'parallel') {
@@ -884,9 +941,17 @@ async function _sendRoundRobin(msg, box) {
     const j = Math.floor(Math.random() * (i + 1));
     [order[i], order[j]] = [order[j], order[i]];
   }
+  const spoken = [];  // replies given so far THIS round
   for (let turn = 0; turn < order.length; turn++) {
     const idx = order[turn];
     const m = _models[idx];
+
+    // Deliver the replies already given this round BEFORE posting the question,
+    // and as attributed assistant turns. The question has to stay the last
+    // message; the old code injected a rival's complete answer as a `user`
+    // message directly above it, and the next speaker - often the same model -
+    // reproduced that answer verbatim.
+    await _injectPeerBlocks(idx, spoken);
 
     const wrap = _createGroupBubble(m, box);
     uiModule.scrollHistory();
@@ -896,50 +961,54 @@ async function _sendRoundRobin(msg, box) {
     await _streamToHolder(idx, _participantSessions[idx], msg, wrap, ac);
     _abortControllers = [];
 
-    // After each response, inject it into all OTHER participant sessions
     const response = wrap.dataset.raw || '';
-    if (response) {
-      for (let j = 0; j < _participantSessions.length; j++) {
-        if (j === idx || !_participantSessions[j]) continue;
-        try {
-          await fetch(`${API_BASE}/api/session/${_participantSessions[j]}/inject_messages`, {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages: [{
-              role: 'user',
-              content: `[${m._groupName || m.display}]: ${response}`
-            }]}),
-          });
-        } catch (e) { console.warn('[group] sync failed:', e); }
-      }
-    }
+    if (response) spoken.push({ idx, name: m._groupName || m.display, text: response });
   }
   // Order is randomized per-message now, so _roundRobinIdx no longer drives
   // turn order; left in state for backward compat only.
   _saveState();
 }
 
-/** After parallel responses, inject each model's response into all other sessions. */
+/** Shares this round's replies with the other participants as attributed
+ *  assistant turns (see _injectPeerBlocks). */
 async function _syncAllResponses(holders) {
+  const spoken = [];
   for (let i = 0; i < holders.length; i++) {
     const response = holders[i].dataset.raw || '';
     if (!response) continue;
     const model = _models[i];
-    for (let j = 0; j < _participantSessions.length; j++) {
-      if (j === i || !_participantSessions[j]) continue;
-      try {
-        await fetch(`${API_BASE}/api/session/${_participantSessions[j]}/inject_messages`, {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: [{
-            role: 'user',
-            content: `[${model._groupName || model.display}]: ${response}`
-          }]}),
-        });
-      } catch (e) { /* silent */ }
+    spoken.push({ idx: i, name: model._groupName || model.display, text: response });
+  }
+  for (let j = 0; j < _participantSessions.length; j++) {
+    if (!_participantSessions[j]) continue;
+    await _injectPeerBlocks(j, spoken);
+  }
+}
+
+/** Injects the given replies into one participant's session as a single
+ *  attributed ASSISTANT turn, excluding that participant's own reply.
+ *  Call it before a turn's question is posted so the question ends the context.
+ *  Returns true when something was delivered. */
+async function _injectPeerBlocks(selfIdx, spoken) {
+  const sessionId = _participantSessions[selfIdx];
+  if (!sessionId) return false;
+  const block = buildPeerTurnBlock((spoken || []).filter(s => s && s.idx !== selfIdx));
+  if (!block) return false;
+  try {
+    const res = await fetch(`${API_BASE}/api/session/${sessionId}/inject_messages`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: [block] }),
+    });
+    if (!res.ok) {
+      console.warn('[group] peer injection failed: HTTP', res.status);
+      return false;
     }
+    return true;
+  } catch (e) {
+    console.warn('[group] peer injection failed:', e);
+    return false;
   }
 }
 
