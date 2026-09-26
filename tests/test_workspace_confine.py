@@ -9,6 +9,9 @@ confined automatically and a new tool cannot accidentally bypass it.
 Covers: the resolver helper, the central binding (the safety net), end-to-end
 confinement of read/write/edit/grep/ls + subprocess cwd via execute_tool_block,
 the get_workspace tool, no-leak across calls, and the admin-gated browse route.
+Also covers tool selection for file-work turns (a bound workspace, or a
+continuation/earlier turn naming a local path, keeps the read-only file tools)
+and web_fetch refusing a local path instead of treating it as a URL.
 """
 import json
 import os
@@ -531,3 +534,231 @@ def test_request_workspace_gate(ws, monkeypatch):
     monkeypatch.setattr(ts, "owner_is_admin_or_single_user", lambda owner: True)
     assert cr._resolve_request_workspace(object(), ws) == (os.path.realpath(ws), "")
     assert cr._resolve_request_workspace(object(), "/nonexistent/xyz") == ("", "/nonexistent/xyz")
+
+
+# ── tool selection: continuation turns keep the file tools ───────────────
+# "Lets continue to look into what might be causing this issue" opens with a
+# continuation verb but trails into new words, so the end-anchored
+# _EXPLICIT_CONTINUATION_RE missed it and the turn read as a brand-new request.
+# Retrieval then ran on that sentence alone — where "look into" seeds the `web`
+# domain — so the file tools the previous turn was using disappeared mid
+# investigation and the model handed a local path to `web_fetch`. Reported
+# session 960ef2a3: tools_sent dropped 36 -> 5, all web/always-available.
+
+# A local path, not a URL: the checkout the reported conversation was about.
+_LOCAL_PATH_TURN = r"the project is at C:\work\odysseus - review the file content there"
+
+
+def _sent_tool_names_for_turns(
+    monkeypatch,
+    *,
+    workspace,
+    turns,
+    relevant_tools=None,
+    force_keyword_fallback=True,
+):
+    """Tool schemas sent for the LAST turn of a multi-turn conversation.
+
+    Same probe as `_sent_tool_names` above, plus a conversation and an optional
+    caller-provided tool set. Kept as its own helper rather than extending
+    `_sent_tool_names` so the two cannot collide when upstream PR #6400 edits it.
+    """
+    import asyncio
+    import src.agent_loop as al
+
+    monkeypatch.setattr(al, "get_setting", lambda key, default=None: default, raising=False)
+    monkeypatch.setattr(al, "get_mcp_manager", lambda: None, raising=False)
+    monkeypatch.setattr(al, "estimate_tokens", lambda *a, **k: 10, raising=False)
+    monkeypatch.setattr(al, "blocked_tools_for_owner", lambda owner: set(), raising=False)
+    if force_keyword_fallback:
+        import src.tool_index as ti
+
+        def _raise_get_tool_index():
+            raise RuntimeError("skip vector retrieval")
+
+        monkeypatch.setattr(ti, "get_tool_index", _raise_get_tool_index, raising=False)
+
+    captured = []
+
+    async def _fake_stream(_candidates, messages, **kwargs):
+        captured.append(kwargs.get("tools"))
+        yield "data: " + json.dumps({"delta": "ok"}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(al, "stream_llm_with_fallback", _fake_stream, raising=False)
+
+    messages = []
+    for i, content in enumerate(turns):
+        messages.append({"role": "user", "content": content})
+        if i < len(turns) - 1:
+            messages.append({"role": "assistant", "content": "ok"})
+
+    async def _run():
+        gen = al.stream_agent_loop(
+            "https://api.openai.com/v1", "gpt-test", messages,
+            max_rounds=1, relevant_tools=relevant_tools, owner="admin", workspace=workspace,
+        )
+        return [c async for c in gen]
+
+    asyncio.run(_run())
+    schemas = captured[0] or []
+    return {t["function"]["name"] for t in schemas if isinstance(t, dict) and "function" in t}
+
+
+
+def test_investigation_continuation_requires_a_sentence_that_resumes_work():
+    import src.agent_loop as al
+
+    convo = [
+        {"role": "user", "content": _LOCAL_PATH_TURN},
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    def is_cont(text):
+        return al._is_investigation_continuation(convo + [{"role": "user", "content": text}], text)
+
+    for text in (
+        "Continue the investigation",
+        "Lets continue to look into what might be causing this issue",
+        "keep going",
+        "now resume the refactor",
+        "please carry on",
+        "dig deeper",
+    ):
+        assert is_cont(text), text
+
+    # "look into X" on its own is a NEW investigation: it must not inherit stale
+    # context just because it mentions what the previous turn was about.
+    for text in (
+        "look into what might be causing this issue",
+        "investigate the failing test",
+        "review the file content there",
+        "please review the file",
+        "",
+    ):
+        assert not is_cont(text), text
+
+    # Nothing to resume in a first turn.
+    assert not al._is_investigation_continuation(
+        [{"role": "user", "content": "continue"}], "continue"
+    )
+
+
+def test_index_down_continuation_turn_keeps_file_tools(monkeypatch):
+    # ChromaDB down (vector retrieval raises) AND the keyword fallback matching
+    # nothing. The continuation must inherit the file work from the earlier user
+    # turn, so its file tools survive instead of collapsing to web-only.
+    names = _sent_tool_names_for_turns(
+        monkeypatch,
+        workspace=None,
+        turns=[_LOCAL_PATH_TURN, "Lets continue to look into what might be causing this issue"],
+    )
+    assert "read_file" in names
+    assert "grep" in names
+    assert "glob" in names
+    assert "ls" in names
+    assert "web_fetch" in names
+
+
+def test_local_path_turn_keeps_readonly_file_tools_without_workspace(monkeypatch):
+    # The reported session had no workspace bound, so the file tools come from
+    # the local path named in the inherited context: the agent can read it (or
+    # get the confinement error that explains why it cannot) instead of guessing
+    # with web tools.
+    names = _sent_tool_names_for_turns(
+        monkeypatch,
+        workspace=None,
+        turns=[
+            r"the failure happens on my box - the service lives at C:\work\svc",
+            "Lets continue to look into what might be causing this issue",
+        ],
+    )
+    assert "read_file" in names
+    assert "grep" in names
+    assert "ls" in names
+    # read-only floor: nothing that writes or shells out
+    assert "write_file" not in names
+    assert "edit_file" not in names
+    assert "bash" not in names
+
+
+def test_workspace_turn_restores_file_tools_over_caller_set(monkeypatch):
+    # An approval resume passes the sealed tool list it was rendered from, which
+    # short-circuits retrieval. A bound workspace is file work and must stay
+    # readable regardless of what the caller pinned.
+    names = _sent_tool_names_for_turns(
+        monkeypatch,
+        workspace="/tmp",
+        turns=["what is happening with this?"],
+        relevant_tools={"ask_user", "manage_memory", "update_plan", "web_search", "web_fetch"},
+    )
+    assert "read_file" in names
+    assert "grep" in names
+    assert "get_workspace" in names
+    # writes/shell still need a real ask
+    assert "write_file" not in names
+    assert "edit_file" not in names
+    assert "bash" not in names
+
+# ── web_fetch: a local path is not a URL ────────────────────────────────
+
+def _web_fetch(arg):
+    import asyncio
+    from src.agent_tools.web_tools import WebFetchTool
+
+    return asyncio.run(WebFetchTool().execute(arg, ctx={}))
+
+
+def test_web_fetch_rejects_local_paths_with_a_read_file_hint():
+    for arg in (
+        r"C:\Users\dev\odysseus\src\agent_loop.py",
+        "C:/Users/dev/agent_loop.py",
+        "/etc/hosts",
+        r"\\server\share\file.txt",
+        "~/notes.txt",
+    ):
+        out = _web_fetch(arg)
+        assert out.get("exit_code") == 1, arg
+        assert "not a URL" in out["error"], arg
+        assert "read_file" in out["error"], arg
+
+
+def test_web_fetch_rejects_an_existing_relative_path(monkeypatch):
+    from src.agent_tools import web_tools
+
+    monkeypatch.setattr(
+        web_tools.os.path, "exists", lambda p: str(p) == "src/agent_loop.py"
+    )
+    out = _web_fetch("src/agent_loop.py")
+    assert out["exit_code"] == 1
+    assert "read_file" in out["error"]
+
+
+def test_web_fetch_still_accepts_urls_and_domains(monkeypatch):
+    import src.search.content as content_mod
+
+    seen = []
+
+    def fake_fetch(url, timeout=10, max_bytes=None):
+        seen.append(url)
+        return {
+            "content": "body",
+            "title": "T",
+            "error": "",
+            "truncated": False,
+            "fetched_bytes": 4,
+            "total_bytes": 4,
+        }
+
+    monkeypatch.setattr(content_mod, "fetch_webpage_content", fake_fetch)
+
+    for arg in ("https://example.com", "example.com", "example.com/path", "some/unknown/thing"):
+        out = _web_fetch(arg)
+        assert out["exit_code"] == 0, arg
+    assert seen == [
+        "https://example.com",
+        "https://example.com",
+        "https://example.com/path",
+        "https://some/unknown/thing",
+    ]
+

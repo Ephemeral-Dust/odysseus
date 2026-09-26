@@ -99,3 +99,103 @@ def test_emits_loop_breaker_triggered_when_loop_breaker_trips(monkeypatch):
     guard = next((e for e in events if e.get("type") == "loop_breaker_triggered"), None)
     assert guard is not None, events
     assert guard["reason"] == "loop_breaker_stall"
+
+
+# ---------------------------------------------------------------------------
+# Intent-without-action supervisor: length-cap + anchor regressions.
+#
+# Live session 960ef2a3 (model qwen3.5-9b-uncensored-hauhaucs-aggressive) had
+# four turns end with NO streamed event at all. The model announced an action,
+# emitted no tool call, and control fell through to the bare
+# `break  # no tools — done` at the bottom of the supervisor because the
+# predicate above it never fired:
+#
+#   17:49:31   420 chars  regex matched, len >= 400         -> missed
+#   17:49:54   443 chars  regex matched, len >= 400         -> missed
+#   17:50:03   475 chars  regex matched, len >= 400         -> missed
+#   17:52:50   194 chars  no match ("...handled:Let me...")  -> missed
+#
+# The first three were long only because the model emitted *untagged* inline
+# reasoning ahead of a short, 51-char visible answer. _strip_think_blocks drops
+# <think> tags only, so the whole-text length cap was measuring reasoning
+# instead of the promise. The predicate now scores the closing paragraph and
+# accepts clause boundaries (":", ";", ".", "?", "!") as an anchor.
+# ---------------------------------------------------------------------------
+
+
+def test_emits_intent_nudge_exhausted_when_reasoning_inflates_round_text(monkeypatch):
+    _patch_common(monkeypatch)
+
+    reasoning = (
+        "Now I have the full context about the available tools and how the "
+        "agent loop dispatches them. The issue the user described is clear: "
+        "when they call web_search or a file tool, the arguments are not "
+        "being resolved against the workspace root, they are being routed at "
+        "a remote repository path instead. Before changing any code I want to "
+        "confirm whether that resolver is shared between the web and file "
+        "code paths, and whether the routing table is built at import time."
+    )
+    answer = "Let me look at the issue tracker for related bugs:"
+    round_text = f"{reasoning}\n\n{answer}"
+
+    # Precondition: this shape only stalls because the whole round busts the
+    # cap while the visible answer does not.
+    assert len(round_text) > 400, len(round_text)
+    assert len(answer) < 400
+
+    events = _run_loop(monkeypatch, round_text, max_rounds=5)
+
+    guard = next((e for e in events if e.get("type") == "intent_nudge_exhausted"), None)
+    assert guard is not None, events
+    assert guard["reason"] == "intent_without_action_nudge_cap"
+    assert guard["nudges"] == 2
+    assert "issue tracker" in guard["matched"]
+
+
+def test_emits_intent_nudge_exhausted_for_clause_anchored_promise(monkeypatch):
+    _patch_common(monkeypatch)
+
+    # The only lead-in here sits immediately after ":", with no space and no
+    # preceding newline — the old "(?:^|\n)" anchor could not see it.
+    round_text = (
+        "I have the repository structure now and the tool dispatch module is "
+        "where path mapping happens:Let me continue investigating the source "
+        "code to find where the routing decision is made:"
+    )
+
+    events = _run_loop(monkeypatch, round_text, max_rounds=5)
+
+    guard = next((e for e in events if e.get("type") == "intent_nudge_exhausted"), None)
+    assert guard is not None, events
+    assert guard["reason"] == "intent_without_action_nudge_cap"
+    # "continue" only matches via the clause-boundary anchor.
+    assert "continue" in guard["matched"]
+
+
+def test_no_intent_nudge_for_let_me_know(monkeypatch):
+    _patch_common(monkeypatch)
+
+    events = _run_loop(
+        monkeypatch,
+        "Sounds reasonable. Let me know what you think about this approach.",
+        max_rounds=5,
+    )
+
+    assert not any(e.get("type") == "intent_nudge_exhausted" for e in events), events
+    assert not any(e.get("type") == "agent_step" for e in events), events
+
+
+def test_no_intent_nudge_when_round_ends_on_a_real_answer(monkeypatch):
+    _patch_common(monkeypatch)
+
+    # A mid-round promise followed by an actual answer: the turn did not end on
+    # the promise, so the closing paragraph decides — no nudge, no guard.
+    events = _run_loop(
+        monkeypatch,
+        "Let me check the earlier results first.\n\n"
+        "All three hosts responded. The endpoint returns 200 and the "
+        "certificate chain is valid, so nothing is wrong server side.",
+        max_rounds=5,
+    )
+
+    assert not any(e.get("type") == "intent_nudge_exhausted" for e in events), events

@@ -37,7 +37,7 @@ from src.tool_security import (
     email_tool_policy_names,
     plan_mode_disabled_tools,
 )
-from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy
+from src.tool_policy import GUIDE_ONLY_DIRECTIVE, LOCAL_FS_PATH_RE, WEB_TOOL_NAMES, ToolPolicy
 from src.tool_capabilities import (
     ResultIntegrity,
     ToolRunSecurityContext,
@@ -596,7 +596,7 @@ Use this instead of `bash`, `curl`, `python`, `requests`, or scraping code for w
 ```web_fetch
 <url or domain>
 ```
-Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check example.com", "what does this page say <url>"). A bare domain like `example.com` works (defaults to https). Use this when you already have a concrete URL. For open-ended lookups use `web_search`, and for "research X" jobs use `trigger_research`.""",
+Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check example.com", "what does this page say <url>"). A bare domain like `example.com` works (defaults to https). Takes an http(s) URL ONLY — never a local filesystem path: to read a file or to list a folder on this machine use `read_file`, `ls`, or `grep`. Use this when you already have a concrete URL. For open-ended lookups use `web_search`, and for "research X" jobs use `trigger_research`.""",
 
     "read_file": """\
 ```read_file
@@ -1311,6 +1311,20 @@ _RETRY_CONTINUATION_RE = re.compile(
     r"start it again|failed|fails?|died|crashed|broke|insta|instantly)\b",
     re.IGNORECASE,
 )
+# Sentence-style continuations ("Lets continue to look into …", "now keep going
+# and finish the refactor"). _EXPLICIT_CONTINUATION_RE is END-anchored, so it
+# only recognises TERSE replies ("continue", "do it", "1"); a continuation that
+# trails into new words was classified as a brand-new request. Retrieval then ran
+# on that sentence alone — whose "look into" wording seeds the `web` domain — and
+# the file tools the previous turn was using disappeared. Match the OPENER
+# instead. A bare "look into X" is deliberately NOT a continuation: that is a new
+# investigation, and it must not inherit stale context.
+_INVESTIGATION_CONTINUATION_RE = re.compile(
+    r"^\s*(?:let'?s\s+|now\s+|ok(?:ay)?,?\s+|please\s+|just\s+)?"
+    r"(?:continue|carry on|keep going|go on|proceed|resume|"
+    r"keep (?:investigating|looking|digging|going)|dig deeper)\b",
+    re.IGNORECASE,
+)
 _COOKBOOK_CONTEXT_RE = re.compile(
     r"\b(?:cookbook|serve|serving|served|launch|start|preset|vllm|sglang|"
     r"llama\.?cpp|ollama|download|cached models?|model servers?|running models?|"
@@ -1353,6 +1367,26 @@ def _is_contextual_retry_continuation(messages: List[Dict], text: str) -> bool:
     return bool(_COOKBOOK_CONTEXT_RE.search(recent))
 
 
+def _is_investigation_continuation(messages: List[Dict], text: str) -> bool:
+    """True when a sentence-style "continue/keep going" reply resumes prior work.
+
+    The end-anchored `_EXPLICIT_CONTINUATION_RE` only recognises terse replies,
+    so "Lets continue to look into what might be causing this issue" read as a
+    brand-new request: tool retrieval ran on that sentence alone, its "look into"
+    wording seeded the `web` domain, and the file tools the previous turn was
+    using vanished — the model then narrated the investigation or handed a local
+    path to `web_fetch`. Recognising the opener instead lets the turn inherit the
+    recent user turns for retrieval, exactly like terse continuations already do.
+
+    Requires an existing conversation, and matches only a continuation VERB at
+    the start: "look into X" by itself is a new investigation, not a resume.
+    """
+
+    if _user_turn_count(messages) <= 1:
+        return False
+    return bool(_INVESTIGATION_CONTINUATION_RE.match(str(text or "").strip()))
+
+
 def _assistant_requested_followup(messages: List[Dict]) -> bool:
     """True when the previous assistant turn asked for missing task details.
 
@@ -1389,13 +1423,18 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     """Classify only whether this turn deserves domain tool retrieval.
 
     Normal chat should not inherit old Cookbook/email/document context. Recent
-    context is used only for explicit continuations ("yes", "do it", "1").
+    context is used only for continuations: a terse "yes"/"do it"/"1" or an explicit "continue/keep going" opener (see _is_investigation_continuation).
     This function does not inject tools directly; selected tools later decide
     which domain rule packs get appended to the system prompt.
     """
     text = str(last_user or "").strip()
     retry_continuation = _is_contextual_retry_continuation(messages, text)
-    continuation = _is_explicit_continuation(text) or _assistant_requested_followup(messages) or retry_continuation
+    continuation = (
+        _is_explicit_continuation(text)
+        or _assistant_requested_followup(messages)
+        or retry_continuation
+        or _is_investigation_continuation(messages, text)
+    )
     retrieval_query = _recent_context_for_retrieval(messages) if continuation else text
     q = retrieval_query.lower()
 
@@ -3988,6 +4027,30 @@ async def stream_agent_loop(
             _relevant_tools = set(_WORKSPACE_TERMINUS_TOOLS)
             logger.info("[tool-rag] Workspace file/terminal request; using Odysseus Terminus toolset")
 
+    # A file-work turn must keep a usable way to READ files. A down ChromaDB, a
+    # keyword-fallback miss, or a caller-provided set (approval resume pins the
+    # sealed tool list it was rendered from) can each leave such a turn holding
+    # only ALWAYS_AVAILABLE + web tools; the model then narrates the
+    # investigation or hands a local path to `web_fetch`. Union the READ-ONLY
+    # file tools back in — never replace — so `read_file`/`grep`/`glob`/`ls`
+    # survive every selection path; writes and shell stay gated behind a real ask
+    # (a `files` domain hit or RAG). An active workspace is the file-work signal;
+    # with no workspace bound, naming a local path is (LOCAL_FS_PATH_RE).
+    # disabled_tools / plan-mode / MCP filters still subtract from the result
+    # below, so this cannot resurrect a tool the turn is not allowed to use.
+    if not guide_only and _relevant_tools is not None and (
+        workspace or LOCAL_FS_PATH_RE.search(_retrieval_query or "")
+    ):
+        from src.tool_security import PLAN_MODE_READONLY_TOOLS
+        _readonly_file_tools = _DOMAIN_TOOL_MAP["files"] & PLAN_MODE_READONLY_TOOLS
+        _missing_file_tools = _readonly_file_tools - _relevant_tools
+        if _missing_file_tools:
+            _relevant_tools |= _readonly_file_tools
+            logger.info(
+                "[tool-rag] File-work turn missing file tools; restored read-only file tools=%s",
+                sorted(_missing_file_tools),
+            )
+
     # If this turn targets the open document, keep editing tools available
     # regardless of which selection path (RAG, keyword, caller-provided) ran.
     # Do not leak document tools into unrelated turns just because the editor
@@ -4454,13 +4517,20 @@ async def stream_agent_loop(
     # Match the common phrasings + an action verb that maps to an available
     # tool, so we don't nudge on harmless transitional text like "let me
     # know what you think".
+    # Anchor: sentence-start, line-start, or a clause boundary (`:` `;` `.`
+    # `?` `!`). The original required ^/\n only, so it missed real stalls where
+    # untagged inline reasoning ran straight into the announcement
+    # ("...is handled:Let me continue investigating...") — live session
+    # 960ef2a3, 17:52:50.
     _INTENT_RE = re.compile(
-        r"(?:^|\n)\s*(?:let me|i'?ll|i will|i need to|we need to|need to|"
-        r"i should|we should|i must|we must|going to|let's)\s+"
+        r"(?:^|\n|[.!?:;]\s*)\s*(?:let me|i'?ll|i will|i need to|we need to|"
+        r"need to|i should|we should|i must|we must|going to|let's)\s+"
         r"(?:tail|check|investigate|look at|see|tail|read|fetch|inspect|"
         r"verify|diagnose|examine|debug|capture|grab|pull|view|run|call|"
         r"trigger|launch|start|kick off|stop|kill|restart|adopt|serve|"
-        r"register|adopt|list|search|find|query|hit|ping|test|use|perform|do)"
+        r"register|adopt|list|search|find|query|hit|ping|test|use|perform|do|"
+        r"continue|proceed|dive|dig|explore|trace|walk|track|open|grep|"
+        r"try|attempt|scan|review|compare|narrow|isolate|reproduce|confirm)"
         r"\b[^.\n]{0,140}",
         re.IGNORECASE,
     )
@@ -5481,15 +5551,33 @@ async def stream_agent_loop(
             # _MAX_INTENT_NUDGES so a model that genuinely cannot use the
             # tool doesn't pin us in a forever loop.
             _intent_text = _strip_think_blocks(cleaned_round).strip()
-            _intent_match = _INTENT_RE.search(_intent_text) if _intent_text else None
+            # Score the CLOSING paragraph, not the whole round. Weak models
+            # emit long *untagged* inline reasoning before a short
+            # announcement ("<422 chars of reasoning>\n\nLet me look at the
+            # tracker:"). _strip_think_blocks only removes <think> tags, so
+            # that reasoning stays in _intent_text and the old whole-text
+            # length cap was measuring reasoning instead of the promise —
+            # every real stall went un-nudged and fell through to the bare
+            # done-break (live session 960ef2a3: the 420/443/475-char rounds
+            # at 17:49:31 / 17:49:54 / 17:50:03, where the visible answer was
+            # only 51 chars). The promise that ended the turn is by definition
+            # in the last non-empty paragraph.
+            _intent_parts = [
+                _part for _part in re.split(r"\n[ \t\r]*\n", _intent_text)
+                if _part.strip()
+            ]
+            _intent_tail = _intent_parts[-1].strip() if _intent_parts else ""
+            _intent_match = _INTENT_RE.search(_intent_tail) if _intent_tail else None
             # Only nudge when the round REALLY looks like an unfinished
-            # promise: short response (<400 chars), no fenced code/answer,
-            # and an action-intent phrase was matched. Long answers that
-            # happen to contain "let me know" are not stalls.
+            # promise: short closing paragraph (<400 chars), no fenced
+            # code/answer, and an action-intent phrase was matched. Long
+            # answers that happen to contain "let me know" are not stalls.
+            # The fence veto stays on the whole text on purpose: a round that
+            # already emitted code has been handled and must not be nudged.
             _looks_like_promise = (
                 not guide_only
                 and _intent_match is not None
-                and len(_intent_text) < 400
+                and len(_intent_tail) < 400
                 and "```" not in _intent_text
             )
             if _looks_like_promise and _intent_nudge_count < _MAX_INTENT_NUDGES:

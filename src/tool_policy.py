@@ -19,6 +19,39 @@ GUIDE_ONLY_DIRECTIVE = (
 WEB_TOOL_NAMES = frozenset({"web_search", "web_fetch"})
 
 
+# ── local filesystem paths ──────────────────────────────────────────────
+# Two places need to tell "a path on this machine" apart from "a URL/domain":
+#   1. tool selection (agent_loop): a turn that names a local path is file work
+#      and must keep its read-only file tools instead of collapsing to web-only.
+#   2. web_fetch (agent_tools/web_tools): a path is not a URL, so it must be
+#      rejected with a pointer at read_file instead of being turned into
+#      `https://C:\...`.
+# Deliberately narrow: only ROOTED paths match (drive letter, UNC, `/`, `~/`),
+# so a bare domain ("example.com") or a schemed URL never does. The drive-letter
+# branch carries a lookbehind so the "s:/" inside "https://…" is not a path.
+LOCAL_FS_PATH_RE = re.compile(
+    r"(?<![A-Za-z])(?:[A-Za-z]:[\\/])"                      # C:\dir, C:/dir
+    r"|(?:\\\\[^\s\\/]+[\\/])"                              # \\server\share
+    r"|(?:^|[\s\"'`(=])(?:~?/(?![/\s])[^\s\"'`)]*)",         # /etc/hosts, ~/src
+    re.MULTILINE,
+)
+
+
+def looks_like_local_path(value: str) -> bool:
+    """True when `value` names a path on this machine rather than a URL/domain.
+
+    Conservative on purpose — only rooted paths match (see LOCAL_FS_PATH_RE), so
+    a caller can reject them without any risk of rejecting a real URL. Relative
+    paths are intentionally not covered; ``os.path.exists`` is the right test
+    there, and the caller knows whether that is appropriate.
+    """
+
+    s = str(value or "").strip().strip("\"'`")
+    if not s or "://" in s:
+        return False
+    return bool(LOCAL_FS_PATH_RE.match(s))
+
+
 def tool_toggle_enabled(value: object) -> bool:
     """Return true only for explicit true-like tool toggle values."""
 
