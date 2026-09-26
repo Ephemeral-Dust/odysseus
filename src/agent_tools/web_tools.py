@@ -1,9 +1,29 @@
 import asyncio
 import inspect
 import json
+import os
 from typing import Dict, Any
 
 from src.constants import MAX_OUTPUT_CHARS
+from src.tool_policy import looks_like_local_path
+
+
+def _is_existing_relative_path(value: str) -> bool:
+    """True for a separator-bearing relative path that exists on disk.
+
+    `looks_like_local_path` deliberately covers only rooted paths, so this is the
+    extra check for inputs like `src/agent_loop.py`: a bare domain never exists
+    locally, so testing the filesystem is safe and cheap here.
+    """
+
+    s = str(value or "").strip().strip("\"'`")
+    if not s or "://" in s or ("/" not in s and "\\" not in s):
+        return False
+    try:
+        return os.path.exists(s) or os.path.exists(os.path.expanduser(s))
+    except (OSError, ValueError):
+        return False
+
 
 class WebSearchTool:
     async def execute(self, content: str, ctx: dict) -> dict:
@@ -107,6 +127,20 @@ class WebFetchTool:
         low = url.lower()
         if "://" in low and not low.startswith(("http://", "https://")):
             return {"error": f"web_fetch: unsupported URL scheme (only http/https): {url[:80]}", "exit_code": 1}
+        if looks_like_local_path(url) or _is_existing_relative_path(url):
+            # A local path is not a URL. Without this the value went through the
+            # `https://` prefix below and the model got an opaque fetch failure
+            # for a file it could have read directly (observed: the agent passed
+            # `C:\...\src\agent_loop.py` to web_fetch mid-investigation).
+            return {
+                "error": (
+                    f"web_fetch: {url[:120]} is a path on this machine, not a URL. "
+                    "web_fetch reads http(s) URLs only — use read_file to read a "
+                    "local file, ls/glob to list a folder, or grep to search inside "
+                    "files."
+                ),
+                "exit_code": 1,
+            }
         if not low.startswith(("http://", "https://")):
             url = "https://" + url
         loop = asyncio.get_running_loop()
