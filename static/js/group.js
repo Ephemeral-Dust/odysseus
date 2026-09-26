@@ -27,6 +27,55 @@ export function init(apiBase) {
   setTimeout(_initGroupTab, 500);
 }
 
+// ── Pure helpers (no DOM, no network) ──────────────────
+// Deliberately side-effect free and at module scope so they can be exercised by
+// node-backed regression tests (tests/test_group_turn_framing_js.py).
+
+/** Groups of participants that resolved to the same model id. */
+export function duplicateParticipantModels(picked) {
+  const byMid = new Map();
+  (picked || []).forEach((p, i) => {
+    if (!p || !p.mid) return;
+    if (!byMid.has(p.mid)) byMid.set(p.mid, { mid: p.mid, display: p.display || p.mid, indices: [] });
+    byMid.get(p.mid).indices.push(i);
+  });
+  return [...byMid.values()].filter(g => g.indices.length > 1);
+}
+
+/** Gives duplicate participants distinct models, preferring the same endpoint
+ *  (avoids re-auth and model-reload churn on a local server). Returns a new
+ *  array; the first participant of each duplicate group keeps its model, and
+ *  each participant's assigned character is preserved. */
+export function diversifyParticipants(picked, all) {
+  const result = (picked || []).map(p => (p ? { ...p } : p));
+  const changes = [];
+  const unresolved = [];
+  for (const group of duplicateParticipantModels(result)) {
+    const mine = result[group.indices[0]] || {};
+    for (let k = 1; k < group.indices.length; k++) {
+      const idx = group.indices[k];
+      const used = new Set(result.filter(Boolean).map(p => p.mid));
+      const pool = (all || []).filter(m => m && m.mid && !used.has(m.mid));
+      const sameEndpoint = pool.filter(m =>
+        (mine.endpointId && m.endpointId === mine.endpointId) ||
+        (mine.url && m.url === mine.url)
+      );
+      const chosenPool = sameEndpoint.length ? sameEndpoint : pool;
+      if (!chosenPool.length) { unresolved.push(group.display); break; }
+      const chosen = chosenPool[0];
+      const replacement = { ...chosen };
+      if (result[idx] && result[idx].character) replacement.character = result[idx].character;
+      changes.push({
+        index: idx,
+        from: (result[idx] && (result[idx].display || result[idx].mid)) || '',
+        to: chosen.display || chosen.mid,
+      });
+      result[idx] = replacement;
+    }
+  }
+  return { picked: result, changes, unresolved: [...new Set(unresolved)] };
+}
+
 function _initGroupTab() {
   const participantsEl = document.getElementById('group-participants');
   const addBtn = document.getElementById('group-add-btn');
@@ -135,7 +184,10 @@ function _initGroupTab() {
   if (startBtn) startBtn.addEventListener('click', async () => {
     const activeTab = document.querySelector('.preset-tab.active');
     if (!activeTab || activeTab.dataset.chartab !== 'group') return;
-    // Get default model from current session as fallback
+    // Get default model from current session as a LAST-RESORT fallback. It is
+    // announced in a toast and folded into the duplicate check below, because
+    // silently defaulting every model-less participant to the session model is
+    // how a whole group ends up on one model replying near-identically.
     const _defaultModel = (window.sessionModule && window.sessionModule.getSessions) ?
       (() => {
         const s = window.sessionModule.getSessions().find(x => x.id === window.sessionModule.getCurrentSessionId());
@@ -143,15 +195,61 @@ function _initGroupTab() {
         return null;
       })() : null;
 
-    const picked = _groupParticipants.map(p => {
+    let picked = [];
+    const pickedSrc = [];  // _groupParticipants index for each picked entry
+    let defaulted = 0;
+    _groupParticipants.forEach((p, i) => {
+      const usedDefault = !p.model && !!_defaultModel;
       let m = p.model ? { ...p.model } : (_defaultModel ? { ..._defaultModel } : null);
       if (!m || !m.url) {
         console.warn('[group] Participant has no valid model:', p);
-        return null;
+        return;
       }
+      if (usedDefault) defaulted++;
       if (p.character) m.character = { characterId: p.character.id, characterName: p.character.name, characterPrompt: p.character.prompt };
-      return m;
-    }).filter(Boolean);
+      picked.push(m);
+      pickedSrc.push(i);
+    });
+
+    if (defaulted) {
+      uiModule.showToast(defaulted + ' participant(s) had no model - using ' +
+        (_defaultModel ? _defaultModel.display : 'the session model'));
+    }
+
+    // Two participants on the same model produce near-identical replies (the
+    // observed failure mode). Offer to split them before the chat starts.
+    const dupes = duplicateParticipantModels(picked);
+    if (dupes.length) {
+      console.warn('[group] Participants share a model:', dupes);
+      const detail = dupes.map(d => d.display + ' x' + d.indices.length).join(', ');
+      const doDiversify = window.styledConfirm ? await window.styledConfirm(
+        detail + ' share the same model, so those participants will reply almost ' +
+        'identically. Assign different models to them?',
+        { confirmText: 'Diversify', cancelText: 'Continue anyway' }
+      ) : false;
+      if (doDiversify) {
+        const allModels = await _getModels();
+        const outcome = diversifyParticipants(picked, allModels);
+        picked = outcome.picked;
+        if (outcome.changes.length) {
+          uiModule.showToast('Diversified: ' + outcome.changes.map(c => c.to).join(', '));
+        }
+        if (outcome.unresolved.length) {
+          uiModule.showToast('Only one model available for: ' + outcome.unresolved.join(', '));
+        }
+        // Mirror the result into the picker rows so a second Start — and the
+        // auto-saved preset below — reflects the diversified line-up.
+        picked.forEach((m, k) => {
+          const src = _groupParticipants[pickedSrc[k]];
+          if (src) src.model = { mid: m.mid, display: m.display, url: m.url, endpointId: m.endpointId };
+        });
+        _render();
+      }
+    }
+
+    if (duplicateParticipantModels(picked).length) {
+      uiModule.showToast('Warning: participants share a model - replies may repeat');
+    }
 
     if (picked.length < 2) { uiModule.showToast('Need at least 2 participants — add models or characters'); return; }
 
@@ -302,14 +400,23 @@ function _initGroupTab() {
           // Load preset participants
           const [models, chars] = await Promise.all([_getModels(), _getCharacterList()]);
           _groupParticipants.length = 0;
+          // Don't coerce an unavailable modelId onto models[0]: that silently put
+          // every stale participant on the same model. Keep the slot (the row
+          // renders "?") so the user can fix it, and let the Start-time duplicate
+          // check surface it.
+          let missingModels = 0;
           (g.participants || []).forEach(p => {
-            const model = models.find(m => m.mid === p.modelId) || models[0];
-            const entry = { model: model || null, character: null };
+            const model = models.find(m => m.mid === p.modelId) || null;
+            if (!model) missingModels++;
+            const entry = { model, character: null };
             if (p.characterId) {
               entry.character = chars.find(c => c.id === p.characterId) || null;
             }
-            if (entry.model) _groupParticipants.push(entry);
+            _groupParticipants.push(entry);
           });
+          if (missingModels) {
+            uiModule.showToast(missingModels + ' preset model(s) unavailable - set a model for those participants');
+          }
           _mode = g.mode || 'parallel';
           _render();
         });
