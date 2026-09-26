@@ -952,6 +952,11 @@ async function _streamToHolder(modelIdx, sessionId, msg, holderEl, abortCtrl) {
   const fd = new FormData();
   fd.append('message', msg);
   fd.append('session', sessionId);
+  // Group turns are plain chat turns. Without an explicit mode the server reads
+  // '' and takes the agent branch, sending the whole tool catalogue with every
+  // group reply (10k-14k prompt tokens instead of ~1k) and leaking agent
+  // chatter ("No active plan found.") into the bubbles.
+  fd.append('mode', 'chat');
 
   let accumulated = '';
   let _buffer = '';
@@ -965,6 +970,20 @@ async function _streamToHolder(modelIdx, sessionId, msg, holderEl, abortCtrl) {
       credentials: 'same-origin',
       signal: abortCtrl.signal,
     });
+    if (!res.ok || !res.body) {
+      // Without this check a failed round silently produced an empty bubble and
+      // the question was stored again, so every participant showed up twice.
+      let detail = '';
+      try { detail = (await res.text()).substring(0, 300); } catch (e) {}
+      if (holderEl._spinner) { holderEl._spinner.destroy(); delete holderEl._spinner; }
+      bodyEl.innerHTML = '';
+      const errDiv = document.createElement('div');
+      errDiv.style.cssText = 'color:var(--color-error);font-style:italic;';
+      errDiv.textContent = `[HTTP ${res.status}] ${detail || 'request failed'}`;
+      bodyEl.appendChild(errDiv);
+      console.error('[group] chat_stream failed:', res.status, detail);
+      return;
+    }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
 
