@@ -4286,13 +4286,13 @@ async def stream_agent_loop(
                 candidate_url,
                 candidate_model,
                 fallback=context_length,
+                headers=headers,
             )
             _route_context_lengths[(candidate_url, candidate_model)] = candidate_context
             soft_budget = int(get_setting("agent_input_token_budget", DEFAULT_BUDGET) or 0)
             if soft_budget <= 0:
                 return _without_protection(route_messages)
             before_trim_tokens = estimate_tokens(route_messages)
-            reserve_tokens = min(max(max_tokens or 1024, 512), 2048)
             try:
                 hard_max = int(
                     get_setting("agent_input_token_hard_max", DEFAULT_HARD_MAX)
@@ -4309,21 +4309,26 @@ async def stream_agent_loop(
                 budget_is_explicit,
                 hard_max=hard_max,
             )
+            # `effective_budget` is already an *input budget* — compute_input_token_budget
+            # applies ~0.85 headroom for the reply (or returns the conservative default).
+            # trim_for_context subtracts `reserve_tokens` from its `context_length`
+            # argument, so pass 0 to avoid reserving the reply twice. Previously the
+            # unknown-window conservative default (6000) shrank to 4976 and cut a
+            # 128K model's history down to ~3 messages.
             trimmed_messages = trim_for_context(
                 route_messages,
                 effective_budget,
-                reserve_tokens=reserve_tokens,
+                reserve_tokens=0,
             )
             after_trim_tokens = estimate_tokens(trimmed_messages)
             if after_trim_tokens < before_trim_tokens:
                 logger.info(
                     "[agent] soft-trimmed route model=%s context: %s -> %s tokens "
-                    "(budget=%s, reserve=%s)",
+                    "(budget=%s)",
                     candidate_model,
                     before_trim_tokens,
                     after_trim_tokens,
                     effective_budget,
-                    reserve_tokens,
                 )
             return _without_protection(trimmed_messages)
         except Exception as e:

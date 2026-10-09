@@ -238,7 +238,7 @@ KNOWN_CONTEXT_WINDOWS = {
 _context_cache: Dict[Tuple[str, str], Tuple[int, bool]] = {}
 
 
-def _get_context_length_cached(endpoint_url: str, model: str) -> Tuple[int, bool]:
+def _get_context_length_cached(endpoint_url: str, model: str, headers: Optional[dict] = None) -> Tuple[int, bool]:
     """Return (context_length, known). ``known`` is False only when the value is a
     bare DEFAULT_CONTEXT fallback (no endpoint report and not in the known table)."""
     configured_kind = _configured_endpoint_kind(endpoint_url)
@@ -251,7 +251,7 @@ def _get_context_length_cached(endpoint_url: str, model: str) -> Tuple[int, bool
     if not is_local and cache_key in _context_cache:
         return _context_cache[cache_key]
 
-    ctx, known = _query_context_length(endpoint_url, model)
+    ctx, known = _query_context_length(endpoint_url, model, headers=headers)
     # Only cache non-default values to allow retry on next request.
     # Local endpoints can restart with a different --max-model-len while keeping
     # the same model id, so always re-query them instead of serving stale cache.
@@ -261,26 +261,26 @@ def _get_context_length_cached(endpoint_url: str, model: str) -> Tuple[int, bool
     return ctx, known
 
 
-def get_context_length(endpoint_url: str, model: str) -> int:
+def get_context_length(endpoint_url: str, model: str, headers: Optional[dict] = None) -> int:
     """Get the context window size for a model.
 
     Queries /v1/models on the endpoint and looks for context_length
     or context_window fields. Caches result per (endpoint, model).
     Falls back to DEFAULT_CONTEXT if unavailable.
     """
-    return _get_context_length_cached(endpoint_url, model)[0]
+    return _get_context_length_cached(endpoint_url, model, headers=headers)[0]
 
 
-def get_context_length_known(endpoint_url: str, model: str) -> Tuple[int, bool]:
+def get_context_length_known(endpoint_url: str, model: str, headers: Optional[dict] = None) -> Tuple[int, bool]:
     """Like ``get_context_length`` but also returns whether the window was actually
     discovered (endpoint-reported or in the known-models table) rather than the bare
     DEFAULT_CONTEXT fallback. Callers that *scale* a budget off the window must not
     trust an unknown value — a fallback 128K isn't proof the model holds 128K
     (review on #4122)."""
-    return _get_context_length_cached(endpoint_url, model)
+    return _get_context_length_cached(endpoint_url, model, headers=headers)
 
 
-def budget_context_for_model(endpoint_url: str, model: str, *, fallback: int = 0) -> int:
+def budget_context_for_model(endpoint_url: str, model: str, *, fallback: int = 0, headers: Optional[dict] = None) -> int:
     """Context window to scale the agent input budget against.
 
     Returns the *freshly discovered* window when it was actually proven
@@ -291,7 +291,7 @@ def budget_context_for_model(endpoint_url: str, model: str, *, fallback: int = 0
     unproven number (review on #4122). On probe error, returns ``fallback`` (the
     caller's best-known value) to preserve prior behaviour."""
     try:
-        ctx, known = get_context_length_known(endpoint_url, model)
+        ctx, known = get_context_length_known(endpoint_url, model, headers=headers)
         return ctx if known else 0
     except Exception:
         return fallback
@@ -393,7 +393,7 @@ def _proxy_catalog_context(endpoint_url: str, model: str) -> Optional[int]:
     return None
 
 
-def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
+def _query_context_length(endpoint_url: str, model: str, headers: Optional[dict] = None) -> Tuple[int, bool]:
     """Query the model API for context length. Returns (context_length, known) where
     ``known`` is False only for the bare DEFAULT_CONTEXT fallback."""
     known = _lookup_known(model)
@@ -421,7 +421,7 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
     if is_local_endpoint(endpoint_url):
         try:
             base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
-            r = httpx.get(f"{base}/slots", timeout=REQUEST_TIMEOUT)
+            r = httpx.get(f"{base}/slots", timeout=REQUEST_TIMEOUT, headers=headers)
             if r.is_success:
                 slots = r.json()
                 if isinstance(slots, list) and slots:
@@ -447,7 +447,7 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
 
     models_url = build_models_url(endpoint_url)
     try:
-        r = httpx.get(models_url, timeout=REQUEST_TIMEOUT)
+        r = httpx.get(models_url, timeout=REQUEST_TIMEOUT, headers=headers)
         if r.is_success:
             data = r.json()
             models_list = data.get("data") or []

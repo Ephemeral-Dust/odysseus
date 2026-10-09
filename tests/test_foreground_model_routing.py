@@ -3327,7 +3327,7 @@ def test_agent_fallback_request_uses_candidate_context_budget(
     import src.context_compactor as context_compactor
     import src.model_context as model_context
 
-    def fake_context(candidate_url, candidate_model, fallback=0):
+    def fake_context(candidate_url, candidate_model, fallback=0, headers=None):
         context_lookups.append((candidate_url, candidate_model, fallback))
         return backup_context if candidate_model == "backup-model" else primary_context
 

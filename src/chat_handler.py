@@ -210,6 +210,7 @@ class ChatHandler:
                     model_supports_vision,
                     sess.model or "",
                     getattr(sess, "endpoint_url", "") or "",
+                    getattr(sess, "headers", None) or None,
                 )
 
         if effective_att_ids and vision_enabled:

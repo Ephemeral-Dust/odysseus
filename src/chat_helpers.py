@@ -156,13 +156,100 @@ def lmstudio_supports_vision(url: str, model: str) -> Optional[bool]:
     return None
 
 
-def model_supports_vision(model_name: str, endpoint_url: str = "") -> bool:
+def _endpoint_probe_base(url: str) -> Optional[str]:
+    """Return scheme://host[:port] for a *local* endpoint, or None when the host is
+    not an address we should probe (bare hostnames / public domains). Only IP
+    literals, loopback and .local hosts are eligible for the llama.cpp/OpenAI-style
+    probes below — the LM Studio probe already covers the rest."""
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if host not in {"localhost", "host.docker.internal"} and not host.endswith(".local"):
+            return None
+    scheme = parsed.scheme or "http"
+    if parsed.port is not None:
+        return f"{scheme}://{host}:{parsed.port}"
+    return f"{scheme}://{host}"
+
+
+def endpoint_supports_vision(url: str, model: str, headers: Optional[dict] = None) -> Optional[bool]:
+    """Whether a local endpoint advertises image input for `model` via the
+    llama.cpp / OpenAI-compatible shapes Strata (and similar servers) expose.
+
+    Returns None when nothing is conclusive, so callers fall back to the
+    name-based heuristic. LM Studio keeps its own dedicated probe first (and
+    unchanged); this only runs after that returns None, so LM Studio behaviour
+    is preserved."""
+    # LM Studio's native probe wins when it can decide (unchanged behaviour).
+    lm = lmstudio_supports_vision(url, model)
+    if lm is not None:
+        return lm
+
+    if not model:
+        return None
+    base = _endpoint_probe_base(url)
+    if not base:
+        return None
+
+    # 1. llama.cpp /health exposes an *unauthenticated* `images` flag.
+    try:
+        r = httpx.get(f"{base}/health", timeout=2.5)
+        if r.is_success:
+            data = r.json()
+            if isinstance(data, dict) and isinstance(data.get("images"), bool):
+                return bool(data["images"])
+    except Exception:
+        pass
+
+    # 2. OpenAI-style /v1/models `architecture.input_modalities` (auth-aware).
+    try:
+        r = httpx.get(f"{base}/v1/models", headers=headers, timeout=2.5)
+        if r.is_success:
+            data = r.json()
+            want = (model or "").strip().lower()
+            for m in data.get("data") or []:
+                if not isinstance(m, dict):
+                    continue
+                mid = str(m.get("id", "") or "").strip().lower()
+                if want and mid and mid != want and mid.split("/")[-1] != want.split("/")[-1]:
+                    continue
+                arch = m.get("architecture")
+                mods = arch.get("input_modalities") if isinstance(arch, dict) else None
+                if isinstance(mods, (list, tuple)):
+                    norm = {str(x).lower() for x in mods}
+                    if {"image", "images"} & norm:
+                        return True
+                    if want and "text" in norm:
+                        return False
+    except Exception:
+        pass
+
+    # 3. llama.cpp /props `modalities.vision` (auth-aware).
+    try:
+        r = httpx.get(f"{base}/props", headers=headers, timeout=2.5)
+        if r.is_success:
+            data = r.json()
+            if isinstance(data, dict):
+                mods = data.get("modalities")
+                if isinstance(mods, dict) and isinstance(mods.get("vision"), bool):
+                    return bool(mods["vision"])
+    except Exception:
+        pass
+
+    return None
+
+
+def model_supports_vision(model_name: str, endpoint_url: str = "", headers: Optional[dict] = None) -> bool:
     """Whether a model accepts images, using the endpoint's reported
-    capability when available (LM Studio) and falling back to name-based
-    detection otherwise."""
+    capability when available (LM Studio, llama.cpp, OpenAI-style) and falling
+    back to name-based detection otherwise."""
     if endpoint_url:
         try:
-            advertised = lmstudio_supports_vision(endpoint_url, model_name or "")
+            advertised = endpoint_supports_vision(endpoint_url, model_name or "", headers=headers)
         except Exception:
             advertised = None
         if advertised is not None:
